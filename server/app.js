@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { openDatabase, publicUser, creatorProfiles, settings } from './db.js';
 import { checkProductType, checkOwnership, requirePermission, HttpError, can } from './permissions.js';
 import { token, hashToken, cookies, cookieOptions, session, identify, hashPassword, verifyPassword } from './auth.js';
+
 const now=()=>new Date().toISOString();
 const uid=()=>randomUUID();
 const asyncRoute=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
@@ -16,15 +17,59 @@ const parse=(schema,value)=>{const r=schema.safeParse(value);if(!r.success)throw
 const username=z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/,'Use letters, numbers, dots, hyphens or underscores.');
 const password=z.string().min(12,'Use at least 12 characters.').max(128);
 const productSchema=z.object({title:z.string().trim().min(3).max(120),description:z.string().trim().min(20).max(30000),categoryId:z.string().max(80),type:z.enum(['FREE','PAID']),price:z.number().finite().nonnegative().max(100000),minecraftVersions:z.array(z.string().max(30)).max(30),features:z.string().max(10000).default(''),dependencies:z.string().max(10000).default(''),installation:z.string().max(20000).default(''),changelog:z.string().max(20000).default(''),status:z.enum(['DRAFT','PENDING_REVIEW']).default('PENDING_REVIEW')});
+
 export function createApp({dbPath,dataDir='data/private',env=process.env}={}) {
- const app=express();const db=openDatabase(dbPath);const storage=resolve(dataDir);mkdirSync(storage,{recursive:true});
- app.locals.db=db;app.disable('x-powered-by');if(env.TRUST_PROXY)app.set('trust proxy',/^\d+$/.test(env.TRUST_PROXY)?Number(env.TRUST_PROXY):env.TRUST_PROXY);
+ const app=express();
+ const db=openDatabase(dbPath);
+ const storage=resolve(dataDir);
+ mkdirSync(storage,{recursive:true});
+
+ app.locals.db=db;
+ app.disable('x-powered-by');
+
+ if(env.TRUST_PROXY)app.set('trust proxy',/^\d+$/.test(env.TRUST_PROXY)?Number(env.TRUST_PROXY):env.TRUST_PROXY);
+
+ /*
+  * CORS:
+  * The frontend is hosted on GitHub Pages while this API is hosted on Render.
+  * APP_ORIGIN may contain the GitHub Pages path, so only its origin is used
+  * for browser Origin comparisons.
+  */
+ const configuredAppOrigin=env.APP_ORIGIN || 'https://frdreamoheh12.github.io';
+ let allowedOrigin='https://frdreamoheh12.github.io';
+ try {
+   allowedOrigin=new URL(configuredAppOrigin).origin;
+ } catch {
+   allowedOrigin='https://frdreamoheh12.github.io';
+ }
+
+ app.use((req,res,next)=>{
+   const origin=req.get('origin');
+
+   if(origin===allowedOrigin){
+     res.setHeader('Access-Control-Allow-Origin',origin);
+     res.setHeader('Access-Control-Allow-Credentials','true');
+     res.setHeader('Access-Control-Allow-Methods','GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
+     res.setHeader(
+       'Access-Control-Allow-Headers',
+       req.get('Access-Control-Request-Headers') || 'Content-Type'
+     );
+     res.setHeader('Vary','Origin');
+   }
+
+   if(req.method==='OPTIONS')return res.sendStatus(204);
+
+   next();
+ });
+
  app.use(helmet({contentSecurityPolicy:env.NODE_ENV==='production'?{directives:{defaultSrc:["'self'"],scriptSrc:["'self'",'https://checkout.razorpay.com'],styleSrc:["'self'","'unsafe-inline'",'https://fonts.googleapis.com'],fontSrc:["'self'",'https://fonts.gstatic.com'],imgSrc:["'self'",'data:','https://*.razorpay.com'],connectSrc:["'self'",'https://api.razorpay.com'],frameSrc:['https://api.razorpay.com'],objectSrc:["'none'"],upgradeInsecureRequests:null}}:false}));
+
  const notify=(userId,type,title,message)=>db.prepare('INSERT INTO notifications VALUES (?,?,?,?,?,?,?)').run(uid(),userId,type,title,message,0,now());
  const log=(admin,action,targetId,targetType)=>db.prepare('INSERT INTO activityLogs VALUES (?,?,?,?,?,?)').run(uid(),admin.id,action,targetId,targetType,now());
  const transaction=fn=>{db.exec('BEGIN IMMEDIATE');try{const r=fn();db.exec('COMMIT');return r;}catch(e){db.exec('ROLLBACK');throw e;}};
  const settle=(order,paymentId)=>transaction(()=>{const fresh=db.prepare('SELECT * FROM orders WHERE id=?').get(order.id);if(fresh.status==='PAID')return;if(fresh.status!=='PENDING')throw new HttpError(409,'This order can no longer be completed.');db.prepare('UPDATE orders SET status=?,paymentId=? WHERE id=?').run('PAID',paymentId,order.id);db.prepare('INSERT OR IGNORE INTO purchases VALUES (?,?,?,?)').run(order.buyerId,order.productId,order.id,now());db.prepare('UPDATE products SET sales=sales+1 WHERE id=?').run(order.productId);notify(order.buyerId,'PURCHASE_COMPLETED','Purchase completed','Your resource is ready to download.');});
  const signatureEqual=(expected,actual)=>{if(typeof actual!=='string'||actual.length!==expected.length)return false;const a=Buffer.from(expected),b=Buffer.from(actual);return a.length===b.length&&timingSafeEqual(a,b);};
+
  app.post('/api/payments/webhook',express.raw({type:'application/json',limit:'1mb'}),asyncRoute(async(req,res)=>{
   if(!env.RAZORPAY_WEBHOOK_SECRET)throw new HttpError(503,'Payment webhooks are not configured.');
   const expected=createHmac('sha256',env.RAZORPAY_WEBHOOK_SECRET).update(req.body).digest('hex');if(!signatureEqual(expected,req.get('x-razorpay-signature')))throw new HttpError(400,'Invalid payment signature.');
@@ -34,20 +79,47 @@ export function createApp({dbPath,dataDir='data/private',env=process.env}={}) {
   if(event.event==='refund.processed'){const refund=event.payload?.refund?.entity;const order=refund&&db.prepare('SELECT * FROM orders WHERE paymentId=?').get(refund.payment_id);if(order&&refund.amount===order.amount&&order.status==='PAID')transaction(()=>{db.prepare("UPDATE orders SET status='REFUNDED' WHERE id=?").run(order.id);db.prepare('DELETE FROM purchases WHERE orderId=?').run(order.id);db.prepare('UPDATE products SET sales=MAX(0,sales-1) WHERE id=?').run(order.productId);});}
   res.json({received:true});
  }));
+
  app.use(express.json({limit:'1mb'}));
  app.use('/api',rateLimit({windowMs:60000,limit:Number(env.API_RATE_LIMIT||180),standardHeaders:'draft-8',legacyHeaders:false}));
- app.use((req,res,next)=>{req.user=identify(db,req);if(req.path.startsWith('/api')&&!['GET','HEAD','OPTIONS'].includes(req.method)){
-  const origin=req.get('origin');const expected=env.APP_ORIGIN || `${req.protocol}://${req.get('host')}`;if(origin&&origin!==expected)return res.status(403).json({error:'Cross-origin requests are not permitted.'});if(req.get('sec-fetch-site')==='cross-site')return res.status(403).json({error:'Cross-site requests are not permitted.'});
- }if(req.path.startsWith('/api')&&settings(db).maintenanceMode&&req.user?.role!=='ADMIN'&&!['/api/config','/api/auth/me','/api/auth/login','/api/auth/logout','/api/health'].includes(req.path))return res.status(503).json({error:'AstraLab is temporarily undergoing maintenance.'});next();});
+
+ app.use((req,res,next)=>{
+   req.user=identify(db,req);
+
+   if(req.path.startsWith('/api')&&!['GET','HEAD','OPTIONS'].includes(req.method)){
+     const origin=req.get('origin');
+     let expectedOrigin=allowedOrigin;
+
+     try {
+       expectedOrigin=new URL(env.APP_ORIGIN || allowedOrigin).origin;
+     } catch {}
+
+     if(origin&&origin!==expectedOrigin){
+       return res.status(403).json({error:'Cross-origin requests are not permitted.'});
+     }
+
+     /*
+      * Do NOT block Sec-Fetch-Site: cross-site here.
+      * GitHub Pages -> Render is intentionally cross-site and is allowed
+      * through the CORS middleware above.
+      */
+   }
+
+   if(req.path.startsWith('/api')&&settings(db).maintenanceMode&&req.user?.role!=='ADMIN'&&!['/api/config','/api/auth/me','/api/auth/login','/api/auth/logout','/api/health'].includes(req.path))return res.status(503).json({error:'AstraLab is temporarily undergoing maintenance.'});
+   next();
+ });
+
  const auth=(req,res,next)=>{try{requirePermission(req.user,'account:read');next();}catch(e){next(e);}};
  const admin=(req,res,next)=>{try{requirePermission(req.user,'admin:manage');next();}catch(e){next(e);}};
  const getProduct=id=>{const p=db.prepare('SELECT * FROM products WHERE id=?').get(id);if(!p)throw new HttpError(404,'Product not found.');return p;};
  const shape=p=>{const author=db.prepare('SELECT id,username,avatar FROM users WHERE id=?').get(p.authorId);if(!author.avatar)author.avatar=creatorProfiles.find(c=>c.username===author.username)?.avatar||null;const category=db.prepare('SELECT * FROM categories WHERE id=?').get(p.categoryId);const ratings=db.prepare("SELECT AVG(rating) AS rating,COUNT(*) AS count FROM reviews WHERE productId=? AND status='PUBLISHED'").get(p.id);return {...p,price:p.price/100,featured:Boolean(p.featured),screenshots:JSON.parse(p.screenshots),minecraftVersions:JSON.parse(p.minecraftVersions),author,category,rating:ratings.rating,reviewCount:ratings.count};};
  const visible=(user,p)=>p.status==='PUBLISHED'||(user&&(user.role==='ADMIN'||user.id===p.authorId));
+
  app.get('/api/health',(_,res)=>res.json({status:'ok'}));
  app.get('/api/config',(_,res)=>{const s=settings(db);res.json({siteName:s.siteName,siteDescription:s.siteDescription,logo:s.logo,maintenanceMode:s.maintenanceMode,minimumPrice:s.minimumPrice/100,maximumUploadSize:s.maximumUploadSize,allowedExtensions:s.allowedExtensions,providers:{google:Boolean(env.GOOGLE_CLIENT_ID&&env.GOOGLE_CLIENT_SECRET),discord:Boolean(env.DISCORD_CLIENT_ID&&env.DISCORD_CLIENT_SECRET),payment:Boolean(env.RAZORPAY_KEY_ID&&env.RAZORPAY_KEY_SECRET),email:Boolean(env.SMTP_HOST)}});});
  app.get('/api/auth/me',(req,res)=>res.json({user:publicUser(req.user)}));
  const authLimit=rateLimit({windowMs:15*60000,limit:20,standardHeaders:'draft-8',legacyHeaders:false,message:{error:'Too many attempts. Please try again in a few minutes.'}});
+
  app.post('/api/auth/register',authLimit,asyncRoute(async(req,res)=>{const v=parse(z.object({username,email:z.email(),password,confirmPassword:z.string(),terms:z.literal(true)}).refine(v=>v.password===v.confirmPassword,{message:'Passwords do not match.'}),req.body);const id=uid();const date=now();try{db.prepare('INSERT INTO users (id,username,email,passwordHash,createdAt,updatedAt) VALUES (?,?,?,?,?,?)').run(id,v.username,v.email.toLowerCase(),await hashPassword(v.password),date,date);}catch(e){if(e.message.includes('UNIQUE'))throw new HttpError(409,'That username or email is already registered.');throw e;}res.status(201).json({user:session(db,res,db.prepare('SELECT * FROM users WHERE id=?').get(id))});}));
  app.post('/api/auth/login',authLimit,asyncRoute(async(req,res)=>{const v=parse(z.object({identifier:z.string().trim().min(1).max(254),password:z.string().min(1).max(128),remember:z.boolean().default(false)}),req.body);const u=db.prepare('SELECT * FROM users WHERE email=? OR username=?').get(v.identifier.toLowerCase(),v.identifier);if(!u || u.status!=='ACTIVE' || !await verifyPassword(v.password,u.passwordHash))throw new HttpError(401,'The email, username or password is incorrect.');res.json({user:session(db,res,u,v.remember)});}));
  app.post('/api/auth/logout',(req,res)=>{const raw=cookies(req).astra_session;if(raw)db.prepare('DELETE FROM sessions WHERE id=?').run(hashToken(raw));res.clearCookie('astra_session',cookieOptions);res.json({success:true});});
@@ -68,7 +140,7 @@ export function createApp({dbPath,dataDir='data/private',env=process.env}={}) {
  app.post('/api/products/:id/files',auth,(req,res,next)=>{try{const p=getProduct(req.params.id);checkOwnership(req.user,p);checkProductType(req.user,p.type);req.product=p;next();}catch(e){next(e);}},upload.single('file'),(req,res,next)=>{try{const f=req.file;const kind=req.body.kind;if(!f||!['thumbnail','screenshot','resource'].includes(kind))throw new HttpError(400,'Choose a file and upload type.');const s=settings(db);if(f.size>s.maximumUploadSize*1024*1024)throw new HttpError(400,`Files must be under ${s.maximumUploadSize} MB.`);const ext=extname(f.originalname).toLowerCase();if(kind==='resource'){if(!s.allowedExtensions.includes(ext))throw new HttpError(400,'This file extension is not allowed.');if(['.zip','.jar'].includes(ext)&&f.buffer.subarray(0,2).toString()!=='PK')throw new HttpError(400,'Invalid archive file.');if(!['.zip','.jar'].includes(ext)&&f.buffer.includes(0))throw new HttpError(400,'Invalid text resource.');}else{const png=f.buffer.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));const jpg=f.buffer[0]===255&&f.buffer[1]===216&&f.buffer[2]===255;const webp=f.buffer.subarray(0,4).toString()==='RIFF'&&f.buffer.subarray(8,12).toString()==='WEBP';if(!((png&&ext==='.png')||(jpg&&['.jpg','.jpeg'].includes(ext))||(webp&&ext==='.webp')))throw new HttpError(400,'Choose a valid PNG, JPEG or WebP image.');if(f.size>8*1024*1024)throw new HttpError(400,'Images must be under 8 MB.');if(kind==='screenshot'&&JSON.parse(req.product.screenshots).length>=12)throw new HttpError(400,'Maximum 12 screenshots.');}
  const id=uid();const name=id+ext;writeFileSync(resolve(storage,name),f.buffer);const mime=kind==='resource'?'application/octet-stream':ext==='.png'?'image/png':ext==='.webp'?'image/webp':'image/jpeg';db.prepare('INSERT INTO files VALUES (?,?,?,?,?,?,?,?)').run(id,req.product.id,kind,f.originalname.slice(0,200),name,mime,f.size,now());if(kind==='thumbnail')db.prepare('UPDATE products SET thumbnail=? WHERE id=?').run('/api/files/'+id,req.product.id);if(kind==='screenshot'){const images=JSON.parse(req.product.screenshots);images.push('/api/files/'+id);db.prepare('UPDATE products SET screenshots=? WHERE id=?').run(JSON.stringify(images),req.product.id);}const publish=s.automaticPublishing&&!s.productModeration&&Boolean(db.prepare("SELECT 1 FROM files WHERE productId=? AND kind='resource'").get(req.product.id));db.prepare('UPDATE products SET status=?,updatedAt=? WHERE id=?').run(publish?'PUBLISHED':'PENDING_REVIEW',now(),req.product.id);res.status(201).json({id,url:kind==='resource'?null:'/api/files/'+id,name:f.originalname});}catch(e){next(e);}});
  app.get('/api/files/:id',(req,res,next)=>{try{const f=db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id);if(!f||f.kind==='resource')throw new HttpError(404,'File not found.');const p=getProduct(f.productId);if(!visible(req.user,p))throw new HttpError(404,'File not found.');res.type(f.mime).sendFile(resolve(storage,f.storageName));}catch(e){next(e);}});
- app.get('/api/products/:id/download',auth,(req,res,next)=>{try{const p=getProduct(req.params.id);if(p.status!=='PUBLISHED')throw new HttpError(404,'This resource is not published.');if(p.type==='PAID'&&!db.prepare("SELECT 1 FROM purchases pu JOIN orders o ON pu.orderId=o.id WHERE pu.userId=? AND pu.productId=? AND o.status='PAID'").get(req.user.id,p.id))throw new HttpError(403,'Purchase this resource before downloading.');const f=db.prepare("SELECT * FROM files WHERE productId=? AND kind='resource' ORDER BY createdAt DESC LIMIT 1").get(p.id);if(!f||!existsSync(resolve(storage,f.storageName)))throw new HttpError(404,'The creator has not uploaded a resource file yet.');res.download(resolve(storage,f.storageName),f.originalName,err=>{if(err){if(!res.headersSent)next(err);return;}transaction(()=>{db.prepare('INSERT INTO downloads VALUES (?,?,?,?,?)').run(uid(),req.user.id,p.id,p.authorId,now());db.prepare('UPDATE products SET downloads=downloads+1 WHERE id=?').run(p.id);});});}catch(e){next(e);}});
+ app.get('/api/products/:id/download',auth,(req,res,next)=>{try{const p=getProduct(req.params.id);if(p.status!=='PUBLISHED')throw new HttpError(404,'This resource is not published.');if(p.type==='PAID'&&!db.prepare("SELECT 1 FROM purchases pu JOIN orders o ON pu.orderId=o.id WHERE pu.userId=? AND pu.productId=? AND o.status='PAID'").get(req.user.id,p.id))throw new HttpError(403,'Purchase this resource before downloading.');const f=db.prepare("SELECT * FROM files WHERE productId=? AND kind='resource' ORDER BY createdAt DESC LIMIT 1").get(p.id);if(!f||!existsSync(resolve(storage,f.storageName)))throw new HttpError(404,'The creator has not uploaded a resource file yet.');res.download(resolve(storage,f.storageName),f.originalName,err=>{if(err){if(!res.headersSent)next(err);return;}transaction(()=>{db.prepare('INSERT INTO downloads VALUES (?,?,?,?,?)').run(uid(),req.user.id,p.id,p.authorId,now());db.prepare('UPDATE products SET downloads=downloads+1 WHERE id=?').run(p.id);});}catch(e){next(e);}});
  app.get('/api/account',auth,(req,res)=>{const user=req.user;const downloads=db.prepare('SELECT d.*,p.title,p.thumbnail FROM downloads d JOIN products p ON d.productId=p.id WHERE d.userId=? ORDER BY d.createdAt DESC LIMIT 100').all(user.id);const purchases=db.prepare('SELECT o.*,p.title FROM orders o JOIN products p ON o.productId=p.id WHERE o.buyerId=? ORDER BY o.createdAt DESC LIMIT 100').all(user.id).map(o=>({...o,amount:o.amount/100}));const wishlist=db.prepare("SELECT p.* FROM wishlist w JOIN products p ON w.productId=p.id WHERE w.userId=? AND p.status='PUBLISHED'").all(user.id).map(shape);res.json({user:publicUser(user),downloads,purchases,wishlist,totals:{downloads:db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE userId=?').get(user.id).n,purchases:db.prepare("SELECT COUNT(*) AS n FROM orders WHERE buyerId=? AND status='PAID'").get(user.id).n,wishlist:wishlist.length}});});
  app.patch('/api/account',auth,asyncRoute(async(req,res)=>{const v=parse(z.object({username:username.optional(),bio:z.string().max(1000).optional(),currentPassword:z.string().max(128).optional(),newPassword:password.optional()}),req.body);if(v.newPassword&&!await verifyPassword(v.currentPassword||'',req.user.passwordHash))throw new HttpError(400,'Your current password is incorrect.');try{db.prepare('UPDATE users SET username=?,bio=?,passwordHash=?,updatedAt=? WHERE id=?').run(v.username||req.user.username,v.bio??req.user.bio,v.newPassword?await hashPassword(v.newPassword):req.user.passwordHash,now(),req.user.id);}catch(e){if(e.message.includes('UNIQUE'))throw new HttpError(409,'That username is already taken.');throw e;}if(v.newPassword)db.prepare('DELETE FROM sessions WHERE userId=? AND id!=?').run(req.user.id,hashToken(cookies(req).astra_session));res.json({user:publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id))});}));
  app.post('/api/wishlist/:id',auth,(req,res,next)=>{try{const p=getProduct(req.params.id);if(p.status!=='PUBLISHED')throw new HttpError(404,'Product not found.');db.prepare('INSERT OR IGNORE INTO wishlist VALUES (?,?)').run(req.user.id,p.id);res.json({saved:true});}catch(e){next(e);}});
@@ -79,10 +151,12 @@ export function createApp({dbPath,dataDir='data/private',env=process.env}={}) {
  app.patch('/api/notifications/read',auth,(req,res)=>{db.prepare('UPDATE notifications SET read=1 WHERE userId=?').run(req.user.id);res.json({success:true});});
  app.get('/api/dropper',auth,(req,res,next)=>{try{requirePermission(req.user,'product:create');const products=db.prepare('SELECT * FROM products WHERE authorId=? ORDER BY createdAt DESC').all(req.user.id).map(shape);const data={products,downloads:db.prepare('SELECT d.createdAt,p.title FROM downloads d JOIN products p ON d.productId=p.id WHERE d.authorId=? ORDER BY d.createdAt DESC LIMIT 100').all(req.user.id)};if(can(req.user,'sales:own')){data.sales=db.prepare("SELECT o.id,o.amount,o.status,o.createdAt,p.title FROM orders o JOIN products p ON o.productId=p.id WHERE o.sellerId=? ORDER BY o.createdAt DESC").all(req.user.id).map(o=>({...o,amount:o.amount/100}));data.revenue=data.sales.filter(o=>o.status==='PAID').reduce((sum,o)=>sum+o.amount,0);}res.json(data);}catch(e){next(e);}});
  app.get('/api/dropper/sales',auth,(req,res,next)=>{try{requirePermission(req.user,'sales:own');res.json(db.prepare("SELECT o.id,o.amount,o.status,o.createdAt,p.title FROM orders o JOIN products p ON o.productId=p.id WHERE o.sellerId=?").all(req.user.id).map(o=>({...o,amount:o.amount/100})));}catch(e){next(e);}});
+
  const providerFetch=async(path,body)=>{const r=await fetch('https://api.razorpay.com/v1/'+path,{method:body?'POST':'GET',headers:{Authorization:'Basic '+Buffer.from(env.RAZORPAY_KEY_ID+':'+env.RAZORPAY_KEY_SECRET).toString('base64'),'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});const data=await r.json();if(!r.ok)throw new HttpError(502,'The payment provider could not complete this request.');return data;};
  app.post('/api/orders',auth,asyncRoute(async(req,res)=>{if(!env.RAZORPAY_KEY_ID||!env.RAZORPAY_KEY_SECRET)throw new HttpError(503,'Payments are not configured yet. No payment has been taken.');const v=parse(z.object({productId:z.string().max(80)}),req.body);const p=getProduct(v.productId);if(p.status!=='PUBLISHED'||p.type!=='PAID')throw new HttpError(400,'Choose a published paid resource.');if(db.prepare('SELECT 1 FROM purchases WHERE userId=? AND productId=?').get(req.user.id,p.id))throw new HttpError(409,'You already own this resource.');const id=uid();const order=await providerFetch('orders',{amount:p.price,currency:'USD',receipt:id});db.prepare('INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?)').run(id,req.user.id,p.id,p.authorId,p.price,'PENDING',null,order.id,now());res.status(201).json({id,providerOrderId:order.id,amount:p.price,currency:'USD',keyId:env.RAZORPAY_KEY_ID});}));
  app.post('/api/orders/:id/verify',auth,asyncRoute(async(req,res)=>{const order=db.prepare('SELECT * FROM orders WHERE id=? AND buyerId=?').get(req.params.id,req.user.id);if(!order)throw new HttpError(404,'Order not found.');if(!env.RAZORPAY_KEY_SECRET)throw new HttpError(503,'Payments are not configured.');const v=parse(z.object({paymentId:z.string().max(100),signature:z.string().length(64)}),req.body);const expected=createHmac('sha256',env.RAZORPAY_KEY_SECRET).update(order.providerOrderId+'|'+v.paymentId).digest('hex');if(!signatureEqual(expected,v.signature))throw new HttpError(400,'Payment verification failed.');let payment=await providerFetch('payments/'+encodeURIComponent(v.paymentId));if(payment.order_id!==order.providerOrderId||payment.amount!==order.amount||payment.currency!=='USD')throw new HttpError(400,'Payment details do not match this order.');if(payment.status==='authorized')payment=await providerFetch('payments/'+encodeURIComponent(v.paymentId)+'/capture',{amount:order.amount,currency:'USD'});if(payment.status!=='captured')throw new HttpError(400,'Payment has not been completed.');settle(order,v.paymentId);res.json({success:true});}));
  app.post('/api/support',auth,authLimit,(req,res,next)=>{try{const v=parse(z.object({subject:z.string().trim().min(3).max(100),message:z.string().trim().min(20).max(5000)}),req.body);db.prepare('INSERT INTO supportTickets VALUES (?,?,?,?,?,?)').run(uid(),req.user.id,v.subject,v.message,'OPEN',now());res.status(201).json({message:'Your message has been received.'});}catch(e){next(e);}});
+
  app.use('/api/admin',admin);
  app.get('/api/admin/overview',(req,res)=>{const count=(table,where='1=1')=>db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`).get().n;res.json({totalUsers:count('users'),totalDroppers:count('users',"role IN ('FREE_DROPPER','PAID_DROPPER')"),freeDroppers:count('users',"role='FREE_DROPPER'"),paidDroppers:count('users',"role='PAID_DROPPER'"),totalProducts:count('products'),freeProducts:count('products',"type='FREE'"),paidProducts:count('products',"type='PAID'"),totalDownloads:count('downloads'),totalSales:count('orders',"status='PAID'"),totalRevenue:db.prepare("SELECT COALESCE(SUM(amount),0) AS n FROM orders WHERE status='PAID'").get().n/100,pendingProducts:count('products',"status='PENDING_REVIEW'"),chart:db.prepare("SELECT substr(createdAt,1,10) AS date,COUNT(*) AS count FROM downloads GROUP BY date ORDER BY date DESC LIMIT 30").all()});});
  app.get('/api/admin/users',(req,res)=>res.json(db.prepare('SELECT id,username,email,avatar,role,status,createdAt FROM users ORDER BY createdAt DESC').all().map(u=>({...u,products:db.prepare('SELECT COUNT(*) AS n FROM products WHERE authorId=?').get(u.id).n,downloads:db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE authorId=?').get(u.id).n,sales:db.prepare("SELECT COUNT(*) AS n FROM orders WHERE sellerId=? AND status='PAID'").get(u.id).n,revenue:db.prepare("SELECT COALESCE(SUM(amount),0) AS n FROM orders WHERE sellerId=? AND status='PAID'").get(u.id).n/100}))));
@@ -99,7 +173,7 @@ export function createApp({dbPath,dataDir='data/private',env=process.env}={}) {
  app.post('/api/admin/orders/:id/refund',asyncRoute(async(req,res)=>{if(!env.RAZORPAY_KEY_ID||!env.RAZORPAY_KEY_SECRET)throw new HttpError(503,'The payment provider is not configured.');const order=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);if(!order||order.status!=='PAID'||!order.paymentId)throw new HttpError(400,'Only verified paid orders may be refunded.');const refund=await providerFetch('payments/'+encodeURIComponent(order.paymentId)+'/refund',{amount:order.amount});log(req.user,'Requested order refund',order.id,'ORDER');if(refund.status==='processed')transaction(()=>{db.prepare("UPDATE orders SET status='REFUNDED' WHERE id=?").run(order.id);db.prepare('DELETE FROM purchases WHERE orderId=?').run(order.id);db.prepare('UPDATE products SET sales=MAX(0,sales-1) WHERE id=?').run(order.productId);});res.json({id:refund.id,status:refund.status});}));
  app.get('/api/admin/payments',(req,res)=>res.json(db.prepare('SELECT id,amount,status,paymentId,createdAt FROM orders ORDER BY createdAt DESC').all().map(o=>({...o,amount:o.amount/100}))));
  app.get('/api/admin/downloads',(req,res)=>res.json(db.prepare('SELECT d.id,d.createdAt,u.username,p.title,a.username AS author FROM downloads d JOIN users u ON d.userId=u.id JOIN products p ON d.productId=p.id JOIN users a ON d.authorId=a.id ORDER BY d.createdAt DESC').all()));
- app.get('/api/admin/reviews',(req,res)=>res.json(db.prepare('SELECT r.*,u.username,p.title FROM reviews r JOIN users u ON r.userId=u.id JOIN products p ON r.productId=p.id ORDER BY r.createdAt DESC').all()));
+ app.get('/api/admin/reviews',(req,res)=>res.json(db.prepare('SELECT r.*,u.username,p.title FROM reviews r JOIN users u ON r.userId=u.id ORDER BY r.createdAt DESC').all()));
  app.patch('/api/admin/reviews/:id',(req,res,next)=>{try{const v=parse(z.object({status:z.enum(['PUBLISHED','REJECTED'])}),req.body);db.prepare('UPDATE reviews SET status=? WHERE id=?').run(v.status,req.params.id);log(req.user,'Moderated review',req.params.id,'REVIEW');res.json({success:true});}catch(e){next(e);}});
  app.delete('/api/admin/reviews/:id',(req,res)=>{db.prepare('DELETE FROM reviews WHERE id=?').run(req.params.id);log(req.user,'Deleted review',req.params.id,'REVIEW');res.json({success:true});});
  app.get('/api/admin/reports',(req,res)=>res.json([...db.prepare('SELECT r.*,u.username,p.title FROM reports r JOIN users u ON r.userId=u.id JOIN products p ON r.productId=p.id ORDER BY r.createdAt DESC').all(),...db.prepare('SELECT t.id,t.userId,t.subject AS title,t.message AS reason,t.status,t.createdAt,u.username FROM supportTickets t JOIN users u ON t.userId=u.id').all()].sort((a,b)=>b.createdAt.localeCompare(a.createdAt))));
