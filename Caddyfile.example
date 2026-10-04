@@ -1,0 +1,5 @@
+# Replace this hostname with your domain. Caddy provisions HTTPS automatically.
+astralab.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3000
+}

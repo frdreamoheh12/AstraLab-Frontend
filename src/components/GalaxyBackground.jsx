@@ -1,0 +1,2 @@
+const stars=Array.from({length:95},(_,i)=>({left:((i*73.17+11)%100)+'%',top:((i*37.39+3)%100)+'%',size:i%13===0?2:1,opacity:0.12+(i%7)*0.085}));
+export default function GalaxyBackground(){return <div className="galaxy-background" aria-hidden="true"><div className="nebula nebula-one"/><div className="nebula nebula-two"/>{stars.map((s,i)=><i className={'star '+(i%13===0?'twinkle':'')} key={i} style={{left:s.left,top:s.top,width:s.size,height:s.size,opacity:s.opacity,animationDelay:(i%8)+'s'}}/>)}<div className="shooting-star"/></div>;}

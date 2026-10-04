@@ -1,0 +1,23 @@
+import React,{useEffect,lazy,Suspense} from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter,Routes,Route,Navigate,Outlet,useLocation } from 'react-router-dom';
+import './styles.css';
+import { AppProvider,useApp } from './context';
+import Navbar from './components/Navbar';
+import Footer from './components/Footer';
+import GalaxyBackground from './components/GalaxyBackground';
+import DashboardLayout from './components/DashboardLayout';
+import { ErrorPage,LoadingSkeleton,Icon } from './components/UI';
+import Home from './pages/Home';
+import { Catalog,Categories,Authors,AuthorProfile } from './pages/Catalog';
+import Auth from './pages/Auth';
+import Product from './pages/Product';
+import UserDashboard from './pages/Dashboard';
+import DropperDashboard from './pages/Dropper';
+const ProductEditor=lazy(()=>import('./pages/ProductEditor'));
+const AdminDashboard=lazy(()=>import('./pages/Admin'));
+import Information from './pages/Information';
+class ErrorBoundary extends React.Component{constructor(props){super(props);this.state={error:false};}static getDerivedStateFromError(){return {error:true};}componentDidCatch(error){console.error('Rendering failed:',error.message);}render(){return this.state.error?<ErrorPage code={500}/>:this.props.children;}}
+function ProtectedRoute({roles}){const {user,ready}=useApp();if(!ready)return <main className="container catalog-page"><LoadingSkeleton/></main>;if(!user)return <Navigate to="/login" replace/>;if(roles&&!roles.includes(user.role))return <ErrorPage code={403}/>;return <Outlet/>;}
+function App(){const location=useLocation();const {config,user}=useApp();useEffect(()=>{window.scrollTo(0,0);const title=location.pathname==='/'?'Build. Create. Upgrade.':location.pathname.split('/').filter(Boolean).slice(-1)[0]?.replaceAll('-',' ');document.title='AstraLab — '+(title?title[0].toUpperCase()+title.slice(1):'Build. Create. Upgrade.');},[location.pathname]);const maintenance=config?.maintenanceMode&&user?.role!=='ADMIN';return <><GalaxyBackground/><a className="skip-link" href="#main-content">Skip to content</a><Navbar/><Suspense fallback={<main className="container catalog-page"><LoadingSkeleton/></main>}><div id="main-content" tabIndex={-1}>{maintenance?<main className="maintenance-page"><Icon name="Wrench" size={48}/><h1>A little maintenance.<br/>A better universe.</h1><p>AstraLab is temporarily paused. Please check back soon.</p></main>:<Routes><Route path="/" element={<Home/>}/><Route path="/free" element={<Catalog type="FREE"/>}/><Route path="/paid" element={<Catalog type="PAID"/>}/><Route path="/categories" element={<Categories/>}/><Route path="/products/:id" element={<Product/>}/><Route path="/authors" element={<Authors/>}/><Route path="/authors/:username" element={<AuthorProfile/>}/><Route path="/login" element={<Auth/>}/><Route path="/register" element={<Auth mode="register"/>}/><Route path="/forgot-password" element={<Auth mode="forgot"/>}/>{['about','contact','community','support','terms','privacy','refund-policy'].map(p=><Route key={p} path={'/'+p} element={<Information/>}/>)}<Route element={<ProtectedRoute/>}><Route path="/dashboard" element={<DashboardLayout/>}>{['','downloads','purchases','wishlist','profile','settings'].map(p=><Route key={p} index={!p} path={p||undefined} element={<UserDashboard/>}/>)}</Route></Route><Route element={<ProtectedRoute roles={['FREE_DROPPER','PAID_DROPPER','ADMIN']}/>}><Route path="/dropper" element={<DashboardLayout kind="dropper"/>}><Route index element={<DropperDashboard/>}/><Route path="products" element={<DropperDashboard/>}/><Route path="products/create" element={<ProductEditor/>}/><Route path="products/:id/edit" element={<ProductEditor/>}/><Route path="analytics" element={<DropperDashboard/>}/><Route path="downloads" element={<DropperDashboard/>}/><Route element={<ProtectedRoute roles={['PAID_DROPPER','ADMIN']}/>}><Route path="sales" element={<DropperDashboard/>}/><Route path="revenue" element={<DropperDashboard/>}/></Route></Route></Route><Route element={<ProtectedRoute roles={['ADMIN']}/>}><Route path="/admin" element={<DashboardLayout kind="admin"/>}>{['','users','droppers','products','categories','orders','payments','downloads','reviews','reports','settings','logs'].map(p=><Route key={p} index={!p} path={p||undefined} element={<AdminDashboard/>}/>)}</Route></Route><Route path="/403" element={<ErrorPage code={403}/>}/><Route path="/500" element={<ErrorPage code={500}/>}/><Route path="*" element={<ErrorPage/>}/></Routes>}</div></Suspense><Footer/></>;}
+createRoot(document.getElementById('root')).render(<React.StrictMode><BrowserRouter><AppProvider><ErrorBoundary><App/></ErrorBoundary></AppProvider></BrowserRouter></React.StrictMode>);

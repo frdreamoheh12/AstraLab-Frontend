@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+.env
+test-results/
+playwright-report/
+
+search-debug.png
+home-desktop.png
+home-mobile.png
